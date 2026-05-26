@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import csv
+import io
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from app.models import ReportListResponse, ReportPublic, ReportStatus
 from app.reports import query
@@ -51,3 +54,53 @@ def list_reports(
         offset=offset,
         limit=limit,
     )
+
+
+@app.get("/reports/export")
+def export_reports(
+    status: ReportStatus | None = Query(None, description="Filter by status"),
+    date_from: datetime | None = Query(None, description="Lower bound on created_at (inclusive)"),
+    date_to: datetime | None = Query(None, description="Upper bound on created_at (inclusive)"),
+    sort: str = Query("created_at", description="Sort field"),
+    descending: bool = Query(True, description="Sort descending"),
+) -> StreamingResponse:
+    """Export reports as a downloadable CSV.
+
+    Reuses the filtering and sorting logic, excludes internal fields (internal_id,
+    owner_email), and produces an RFC 4180 compliant CSV.
+    """
+    try:
+        rows = query(
+            status=status,
+            date_from=date_from,
+            date_to=date_to,
+            sort=sort,
+            descending=descending,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    def csv_generator():
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\r\n")
+
+        # Write CSV Header
+        writer.writerow(["id", "title", "status", "owner", "amount", "created_at"])
+        yield output.getvalue()
+        output.seek(0)
+        output.truncate(0)
+
+        # Write CSV Data Rows
+        for r in rows:
+            created_at_str = r.created_at.isoformat()
+            writer.writerow([r.id, r.title, r.status, r.owner, r.amount, created_at_str])
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="reports.csv"',
+        "Access-Control-Expose-Headers": "Content-Disposition",
+    }
+    return StreamingResponse(csv_generator(), media_type="text/csv", headers=headers)
+
